@@ -1,124 +1,206 @@
-# FocalTech FT9348 fingerprint under Linux
+# Отпечаток FocalTech FT9348 под Linux
 
-Making the **FocalTech FT9348** fingerprint sensor (USB `2808:9348`, internal chip `0x9362`,
-64×80 sensor, commonly built into the laptop **power button**) work under Linux — where it has
-**no working driver**.
+> 🇷🇺 Проект из России. Автор: **[narkomart](https://github.com/narkomart)**.
+> Русскоязычный проект по запуску сканера отпечатков FocalTech под Linux.
+> [English version below ↓](#focaltech-ft9348-fingerprint-under-linux-english)
 
-**Status:** capture, enrollment and matching work; fingerprint login is wired via PAM.
-Verified: **sudo** login by fingerprint and **GNOME screen unlock** by fingerprint. On real captures
-the enrolled finger matched on every frame and a different finger was rejected on every frame.
+Заставляем сканер отпечатков **FocalTech FT9348** (USB `2808:9348`, внутренний чип `0x9362`,
+матрица 64×80, обычно встроен в **кнопку питания** ноутбука) работать под Linux — где для него
+**нет рабочего драйвера**.
 
-> This began because stock `libfprint`/`fprintd` only ship a Goodix driver, community kernel drivers
-> target other FocalTech revisions (`9338`/`93a9`/`9e65`, not `9348`), and the chip speaks a
-> **register-over-control-transfer** protocol that the existing bulk-command code never matched.
+**Статус:** захват, регистрация и сравнение отпечатков работают; вход по отпечатку подключён через PAM.
+Проверено: вход по отпечатку в **sudo** и **разблокировка экрана GNOME** отпечатком. На реальных
+снимках зарегистрированный палец совпадал на каждом кадре, а чужой палец отвергался на каждом кадре.
 
-## ⚠️ Important: this repo is not self-contained
+> Всё началось с того, что штатные `libfprint`/`fprintd` содержат только драйвер Goodix, community
+> kernel-драйверы написаны под другие ревизии FocalTech (`9338`/`93a9`/`9e65`, не `9348`), а чип
+> говорит по протоколу **регистры-через-control-transfer**, под который существующий bulk-код никогда
+> не подходил.
 
-Matching uses FocalTech's **proprietary** libfprint `.so`, which contains a CNN (GhostNet) matcher.
-That binary is **copyrighted and is NOT included here.** You must supply it yourself and place it at:
+## ⚠️ Важно: репозиторий не самодостаточен
+
+Для сравнения используется **проприетарный** `.so` FocalTech (libfprint) с CNN-матчером (GhostNet).
+Этот бинарник **защищён авторским правом и НЕ входит в репозиторий.** Его нужно раздобыть самому и
+положить сюда:
 
 ```
 /opt/focaltech/matcher.so
 ```
 
-**Where to get it** (download the `.deb`/`.rpm`/`.so` yourself; we don't redistribute it):
-- [github.com/ftfpteams](https://github.com/ftfpteams) — FocalTech's official proprietary libfprint drivers.
+**Где взять** (скачайте `.deb`/`.rpm`/`.so` сами; мы его не распространяем):
+- [github.com/ftfpteams](https://github.com/ftfpteams) — официальные проприетарные драйверы libfprint от FocalTech.
 - [github.com/leopalladium/focaltech-ft9366-arch-shim](https://github.com/leopalladium/focaltech-ft9366-arch-shim) —
-  patched proprietary driver + shim for modern distros.
+  пропатченный проприетарный драйвер + шим для современных дистрибутивов.
 
-Then let the helper extract, **validate and install** it:
-
-```sh
-sudo bash bio/get-matcher.sh /path/to/driver.deb     # or .rpm, or the .so directly, or a directory
-sudo bash bio/get-matcher.sh --search                # or scan the system for a compatible .so
-```
-
-It checks the file is a compatible FocalTech build (has the required symbols) before installing to
-`/opt/focaltech/matcher.so`, so a wrong file fails loudly instead of silently.
-
-**No manual offsets.** `ftbio` resolves the needed `focal_*` functions and globals **by name** from the
-`.so`'s symbol table at runtime, so any compatible (non-stripped) FocalTech build works — you don't edit
-any addresses. (Historical note: the hardest bug in the project was reading offsets from Ghidra, which
-loads the image at a `+0x100000` base, instead of from `nm`. Runtime resolution sidesteps that entirely.)
-Verify your `.so` is compatible: `sudo /opt/focaltech/ftbio check`.
-
-## How it works
-
-Image capture is our own code over libusb using the chip's control-transfer register protocol.
-Matching is FocalTech's proprietary CNN, called by loading `matcher.so` (`dlopen`, `RTLD_LAZY`) and
-invoking its non-exported `focal_*` functions, resolved by name from the `.so`'s symbol table.
-Everything runs in one process, so there is no clash with the system `libfprint`. Login goes through
-`pam_exec` — no `fprintd`.
-
-Full protocol and matcher API: [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
-
-## Layout
-
-```
-tools/     libusb tools:  ftctl (read register), ftgrab2 (capture a frame), ftenroll (capture N finger frames)
-matcher/   research harnesses:  verify (template compare), enroll_test (enroll/save/load/identify)
-bio/       ftbio.c — standalone enroll/verify (capture + matcher);  install scripts for PAM
-driver/    focaltech9348.c — a libfprint image driver (capture + swipe-assembly + NBIS). NBIS matching is
-           unreliable on this tiny sensor; kept for reference. The reliable path is bio/ftbio + the CNN matcher.
-docs/      PROTOCOL.md — reverse-engineered protocol and matcher notes
-```
-
-## Build & use
+Дальше хелпер сам извлечёт, **проверит и установит** его:
 
 ```sh
-# 0) install FocalTech's proprietary libfprint .so as the matcher (validated):
-sudo bash bio/get-matcher.sh /path/to/driver.deb   # or .rpm / .so / dir, or: --search
+sudo bash bio/get-matcher.sh /path/to/driver.deb     # или .rpm, или сам .so, или каталог
+sudo bash bio/get-matcher.sh --search                # или просканировать систему на совместимый .so
+```
 
-# 1) build the standalone tool
-cd bio && bash build.sh          # -> ./ftbio   (needs libusb-1.0 dev headers)
+Он проверяет, что файл — совместимая сборка FocalTech (есть нужные символы), прежде чем установить в
+`/opt/focaltech/matcher.so`, поэтому неверный файл падает громко, а не молча.
 
-# 2) free the device (no fprintd holding it)
+**Никаких ручных offset-ов.** `ftbio` находит нужные функции и глобалы `focal_*` **по имени** из
+таблицы символов `.so` в рантайме — подойдёт любая совместимая (не stripped) сборка FocalTech, адреса
+править не нужно. (Исторический факт: самым тяжёлым багом в проекте было чтение offset-ов из Ghidra,
+которая грузит образ с базой `+0x100000`, вместо `nm`. Резолв по имени в рантайме снимает эту проблему
+полностью.) Проверка совместимости вашего `.so`: `sudo /opt/focaltech/ftbio check`.
+
+## Как это устроено
+
+Захват изображения — наш собственный код поверх libusb по регистровому control-transfer протоколу чипа.
+Сравнение — проприетарный CNN FocalTech: загружаем `matcher.so` (`dlopen`, `RTLD_LAZY`) и вызываем его
+неэкспортируемые функции `focal_*`, найденные по имени в таблице символов `.so`. Всё работает в одном
+процессе, так что конфликта с системным `libfprint` нет. Вход идёт через `pam_exec` — без `fprintd`.
+
+Полный протокол и API матчера: [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
+
+## История: как мы это сделали
+
+Краткая хроника — от «драйвера нет» до входа по пальцу. Ноутбук `Pro-Magnus-M-DN16R7`, сенсор в
+кнопке питания.
+
+0. **Проблема.** `fprintd`/`libfprint` стоят и исправны, но знают только Goodix → `fprintd-enroll` =
+   «No devices available». Сканер физически есть, а для системы его как бы нет.
+1. **Community-драйвер — тупик.** Взяли `ft9201`-драйвер, добавили PID `0x9348`: модуль собрался,
+   `probe()` сработал, но протокол не совпал — все регистры читались константой `0x0a0a`, кадр = 0 байт.
+   Community-код написан под `9338/93a9/9e65`, а не под наш чип.
+2. **Разбор Windows-драйвера (Ghidra).** Декомпилировали официальный `ftWbioUmdfDriverV2.dll`: это
+   семейство **FT9366 (9368/9369)**, user-mode поверх WinUSB. Выяснили ключевое: детект пальца =
+   чтение регистра `0x43`, а регистры читаются/пишутся **не bulk-командами, а USB control-transfer**.
+   Именно поэтому Linux-путь (`ft9366.c`) с bulk `02 00 …` вечно таймаутил.
+3. **Проприетарный libfprint FocalTech — частичный успех.** Поставили закрытый `.so` + шим + патч
+   USB-ID: `fprintd` **увидел** сенсор, open/init прошли, прочитался chip id `0x9362`, загрузился
+   алгоритм. Но захват не пошёл — библиотека для нашего чипа шла тем же неверным bulk-путём. Зато
+   подтвердилось: внутри `.so` есть **рабочий матчер FocalTech**.
+4. **Прорыв по протоколу (на железе).** Реализовали регистры через control-transfer: чтение = control
+   IN `bmRequestType=0xC0, bRequest=<reg>`. **Reg `0x43`: `0x00` без пальца / `0x01` с пальцем —
+   заработало.** Control по EP0 работает даже когда bulk «завис».
+5. **Захват изображения.** Реверснули последовательность съёмки кадра: wake → sensor mode →
+   `0x34=0xff`; `0x34=3`; `0x6f(wIndex=0x9080, wValue=5120)`; **bulk-IN 5120 байт**. Получили настоящее
+   изображение **64×80 с гребнями отпечатка**.
+6. **Своя попытка на NBIS — потолок.** Написали libfprint-драйвер: захват + свайп-сборка → минуции →
+   enroll завершается. Но verify давал score 0: generic-матчер NBIS ненадёжен на таком микро-сенсоре.
+   Вывод: нужен **родной матчер FocalTech**.
+7. **Интеграция матчера — главный прорыв.** Матчер оказался **свёрточной сетью (GhostNet)** с
+   анти-спуфом. Харнесс падал в `ff_algo_do_config` из-за **опечатки в один hex-символ**: offset брали
+   из Ghidra (`0x143c20`), а она грузит образ с базой `+0x100000`; реальный адрес из `nm` — `0x43c20`.
+   После фикса: конфиг = 0, извлечение template из кадра, сравнение двух шаблонов работает. **Правило:
+   offset-ы — только из `nm`, не из Ghidra.**
+8. **Проверка точности (на реальных пальцах).** 12 кадров своего пальца → все совпали (TAR 100%);
+   8 кадров чужого → все отвергнуты (FAR 0%). Матчер FocalTech надёжно различает пальцы.
+9. **Продукт: автономный бинарь + вход.** Собрали `bio/ftbio` (наш захват + матчер по имени символа).
+   Вход по пальцу в **sudo** (PAM) и **разблокировка экрана GNOME** — работают.
+
+Итог: два наложившихся заблуждения — неверный транспорт (bulk вместо control) и неверный матчер (NBIS
+вместо родного CNN). Архитектура решения: **наш захват (libusb/control) + проприетарный CNN-матчер
+(по символу из `.so`)** в одном процессе, вход — через `pam_exec`, без `fprintd`.
+
+## Структура
+
+```
+tools/     инструменты libusb: ftctl (чтение регистра), ftgrab2 (захват кадра), ftenroll (снять N кадров пальца)
+matcher/   исследовательские харнессы: verify (сравнение шаблонов), enroll_test (enroll/save/load/identify)
+bio/       ftbio.c — автономный enroll/verify (захват + матчер); скрипты установки PAM
+driver/    focaltech9348.c — image-драйвер libfprint (захват + свайп-сборка + NBIS). NBIS на этом крошечном
+           сенсоре ненадёжен, оставлен для справки. Надёжный путь — bio/ftbio + CNN-матчер.
+docs/      PROTOCOL.md — реверснутый протокол и заметки по матчеру
+```
+
+## Сборка и использование
+
+```sh
+# 0) поставить проприетарный .so FocalTech как матчер (с проверкой):
+sudo bash bio/get-matcher.sh /path/to/driver.deb   # или .rpm / .so / каталог, или: --search
+
+# 1) собрать автономный инструмент
+cd bio && bash build.sh          # -> ./ftbio   (нужны dev-заголовки libusb-1.0)
+
+# 2) освободить устройство (чтобы fprintd его не держал)
 sudo systemctl stop fprintd
 
-# 3) enroll your finger (touch the power-button sensor ~12 times, moving slightly)
-sudo ./ftbio enroll "$USER"      # template -> /etc/focaltech/<user>.tpl
+# 3) зарегистрировать палец (коснуться сенсора в кнопке питания ~12 раз, слегка смещая)
+sudo ./ftbio enroll "$USER"      # шаблон -> /etc/focaltech/<user>.tpl
 
-# 4) verify (touch once)
-sudo ./ftbio verify "$USER"      # prints "совпадение" / exit 0 on match
+# 4) проверить (одно касание)
+sudo ./ftbio verify "$USER"      # печатает «совпадение» / exit 0 при совпадении
 ```
 
-### Fingerprint for sudo
+### Отпечаток для sudo
 ```sh
-sudo bash bio/install-pam-sudo.sh      # adds fingerprint as `sufficient`; password stays as fallback
-# test in a NEW terminal:
-sudo -k; sudo id                        # touch the sensor
+sudo bash bio/install-pam-sudo.sh      # добавляет отпечаток как `sufficient`; пароль остаётся резервом
+# проверить в НОВОМ терминале:
+sudo -k; sudo id                        # коснуться сенсора
 ```
 
-### Fingerprint for the GNOME lock screen / login
+### Отпечаток для экрана блокировки / входа GNOME
 ```sh
 sudo bash bio/setup-gdm.sh
-# lock with Super+L and unlock by touching the sensor (no touch in ~6s -> password field)
+# заблокировать Super+L и разблокировать касанием сенсора (нет касания ~6с -> поле пароля)
 ```
-Screen unlock works reliably. The full gdm greeter login may not run `pam_exec` before the password is
-submitted (GNOME-specific); if you need native greeter/settings integration, the proper path is to give
-the libfprint driver the CNN matcher instead of NBIS.
+Разблокировка экрана работает надёжно. Полноценный вход на greeter GDM может не успеть выполнить
+`pam_exec` до отправки пароля (особенность GNOME); для нативной интеграции в greeter/настройки
+правильный путь — отдать CNN-матчер самому libfprint-драйверу вместо NBIS.
 
-`ftbio` env vars: `FT_SO` (path to the matcher `.so`), `FT_TPLDIR` (template dir, default `/etc/focaltech`),
-`FT_TIMEOUT` (verify timeout ms), `FTLOG=1` (verbose algorithm log).
+Переменные окружения `ftbio`: `FT_SO` (путь к матчеру `.so`), `FT_TPLDIR` (каталог шаблонов, по
+умолчанию `/etc/focaltech`), `FT_TIMEOUT` (таймаут verify, мс), `FTLOG=1` (подробный лог алгоритма).
 
-## Recovery
+## Восстановление доступа
 
-Fingerprint is configured as `sufficient`, so the password always remains a fallback — you cannot lock
-yourself out. PAM edits are backed up (`/etc/pam.d/<svc>.bak.<ts>`). If a GUI login misbehaves, switch to
-a TTY (Ctrl+Alt+F3), log in with your password, and restore the backup.
+Отпечаток настроен как `sufficient`, поэтому пароль всегда остаётся резервом — заблокировать себя
+нельзя. Правки PAM бэкапятся (`/etc/pam.d/<svc>.bak.<ts>`). Если GUI-вход глючит — переключитесь на TTY
+(Ctrl+Alt+F3), войдите по паролю и восстановите бэкап.
 
-## Security / privacy
+## Безопасность / приватность
 
-Do not commit biometric data (`*.tpl`, `*.raw`, `cap*/`) or the proprietary `.so` — see `.gitignore`.
-Fingerprint templates are personal data; keep `/etc/focaltech` root-only (the tool sets `0600`).
+Не коммитьте биометрию (`*.tpl`, `*.raw`, `cap*/`) и проприетарный `.so` — см. `.gitignore`. Шаблоны
+отпечатков — персональные данные; держите `/etc/focaltech` доступным только root (инструмент ставит `0600`).
 
-## License
+## Лицензия
 
-GPLv2-or-later (see [`LICENSE`](LICENSE)). `driver/focaltech9348.c` derives from libfprint and is
-GPL/LGPL-compatible accordingly. This project does not include or relicense any FocalTech code.
+GPLv2-or-later (см. [`LICENSE`](LICENSE)). `driver/focaltech9348.c` производен от libfprint и совместим
+с GPL/LGPL. Проект не включает и не перелицензирует код FocalTech.
 
-## Credits
+## Авторство
 
-Reverse engineering and integration for the FT9348. The proprietary matcher and the Windows/Linux
-FocalTech drivers are © FocalTech; this project interoperates with a user-supplied copy and does not
-redistribute it.
+Реверс-инжиниринг и интеграция для FT9348 — **[narkomart](https://github.com/narkomart)**, Россия. 🇷🇺
+Проприетарный матчер и Windows/Linux-драйверы FocalTech — © FocalTech; проект взаимодействует с
+пользовательской копией и не распространяет её.
+
+---
+
+# FocalTech FT9348 fingerprint under Linux (English)
+
+> 🇷🇺 A project from Russia by **[narkomart](https://github.com/narkomart)**.
+
+Making the **FocalTech FT9348** fingerprint sensor (USB `2808:9348`, internal chip `0x9362`, 64×80
+sensor, commonly built into the laptop **power button**) work under Linux — where it has **no working
+driver**.
+
+**Status:** capture, enrollment and matching work; fingerprint login is wired via PAM. Verified: **sudo**
+login by fingerprint and **GNOME screen unlock** by fingerprint. On real captures the enrolled finger
+matched on every frame and a different finger was rejected on every frame.
+
+**Not self-contained:** matching uses FocalTech's **proprietary** libfprint `.so` (a GhostNet CNN
+matcher), which is copyrighted and **NOT included**. Supply it yourself and let the helper validate and
+install it to `/opt/focaltech/matcher.so`:
+
+```sh
+sudo bash bio/get-matcher.sh /path/to/driver.deb   # or .rpm / .so / dir, or: --search
+```
+
+Get it from [github.com/ftfpteams](https://github.com/ftfpteams) or
+[leopalladium/focaltech-ft9366-arch-shim](https://github.com/leopalladium/focaltech-ft9366-arch-shim).
+`ftbio` resolves the `focal_*` functions **by name** from the `.so` symbol table at runtime — no manual
+offsets, any compatible non-stripped build works.
+
+**How it works:** our own libusb capture over the chip's control-transfer register protocol + FocalTech's
+proprietary CNN matcher (`dlopen`, symbols by name), all in one process, login via `pam_exec` (no
+`fprintd`). Full protocol and matcher API: [`docs/PROTOCOL.md`](docs/PROTOCOL.md). Build & usage,
+recovery and the full story of how it was reverse-engineered are in the Russian section above.
+
+**License:** GPLv2-or-later. Reverse engineering and integration by
+**[narkomart](https://github.com/narkomart)** (Russia). The proprietary matcher and FocalTech drivers are
+© FocalTech; this project interoperates with a user-supplied copy and does not redistribute it.
