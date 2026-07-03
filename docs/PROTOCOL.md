@@ -35,14 +35,16 @@ FocalTech's proprietary libfprint `.so` (see README on how to obtain it — it i
 The algorithm in that `.so` is transport-agnostic: you register callbacks and call `focal_*` functions.
 We call the non-exported functions by address = `dlopen` base (`dlinfo` `l_addr`) + symbol offset.
 
-**Offsets are specific to one `.so` build.** Do NOT copy them blindly — derive them for YOUR file:
+`ftbio` resolves these **by name** from the `.so`'s ELF `.symtab` at runtime (see `bio/ftbio.c`), so you
+never hardcode addresses — any compatible non-stripped build works. To inspect them manually:
 
 ```sh
 nm your-focaltech-libfprint.so | grep -E 'ff_algo_do_config|focal_(InitFunc|EnrollByImage|IdentifyByImage|GetMatchFingerId|GetImageTemplate|SaveAlgTplData|InitAlgTplData|VerifyTwoTemplate)'
 ```
 
-⚠️ Use `nm` addresses, **not** Ghidra's — Ghidra loads the image at base `+0x100000`, so its addresses
-are `0x100000` higher. (This one-hex-digit discrepancy was the single hardest bug in the whole project.)
+⚠️ If you ever DO hardcode an address, use `nm` values, **not** Ghidra's — Ghidra loads the image at base
+`+0x100000`, so its addresses are `0x100000` higher. (That one-hex-digit discrepancy was the single
+hardest bug in the whole project — runtime name resolution sidesteps it.)
 
 Functions used (signatures reverse-engineered):
 - `ff_algo_do_config(void)` — configures the algorithm (reads a global `g_device`: chip_id + sensor cols/rows).

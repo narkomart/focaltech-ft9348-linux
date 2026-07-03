@@ -21,21 +21,34 @@ That binary is **copyrighted and is NOT included here.** You must supply it your
 /opt/focaltech/matcher.so
 ```
 
-Where to get it: FocalTech publish proprietary Linux fingerprint drivers (libfprint forks) for their
-sensors; community repositories re-package them. Obtain the libfprint `.so` for the FT9366/FT9368
-family and use it as `matcher.so`. This project only contains **our own** code (USB capture, glue to
-the matcher, PAM integration) plus reverse-engineering notes.
+**Where to get it** (download the `.deb`/`.rpm`/`.so` yourself; we don't redistribute it):
+- [github.com/ftfpteams](https://github.com/ftfpteams) — FocalTech's official proprietary libfprint drivers.
+- [github.com/leopalladium/focaltech-ft9366-arch-shim](https://github.com/leopalladium/focaltech-ft9366-arch-shim) —
+  patched proprietary driver + shim for modern distros.
 
-**The `focal_*` offsets in the code are specific to one `.so` build.** For a different build, re-derive
-them with `nm` (see [`docs/PROTOCOL.md`](docs/PROTOCOL.md)) — and use `nm` addresses, not Ghidra's
-(Ghidra adds a `+0x100000` image base; that off-by-`0x100000` was the hardest bug in the whole project).
+Then let the helper extract, **validate and install** it:
+
+```sh
+sudo bash bio/get-matcher.sh /path/to/driver.deb     # or .rpm, or the .so directly, or a directory
+sudo bash bio/get-matcher.sh --search                # or scan the system for a compatible .so
+```
+
+It checks the file is a compatible FocalTech build (has the required symbols) before installing to
+`/opt/focaltech/matcher.so`, so a wrong file fails loudly instead of silently.
+
+**No manual offsets.** `ftbio` resolves the needed `focal_*` functions and globals **by name** from the
+`.so`'s symbol table at runtime, so any compatible (non-stripped) FocalTech build works — you don't edit
+any addresses. (Historical note: the hardest bug in the project was reading offsets from Ghidra, which
+loads the image at a `+0x100000` base, instead of from `nm`. Runtime resolution sidesteps that entirely.)
+Verify your `.so` is compatible: `sudo /opt/focaltech/ftbio check`.
 
 ## How it works
 
 Image capture is our own code over libusb using the chip's control-transfer register protocol.
 Matching is FocalTech's proprietary CNN, called by loading `matcher.so` (`dlopen`, `RTLD_LAZY`) and
-invoking its non-exported `focal_*` functions by `base+offset`. Everything runs in one process, so
-there is no clash with the system `libfprint`. Login goes through `pam_exec` — no `fprintd`.
+invoking its non-exported `focal_*` functions, resolved by name from the `.so`'s symbol table.
+Everything runs in one process, so there is no clash with the system `libfprint`. Login goes through
+`pam_exec` — no `fprintd`.
 
 Full protocol and matcher API: [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
 
@@ -53,8 +66,8 @@ docs/      PROTOCOL.md — reverse-engineered protocol and matcher notes
 ## Build & use
 
 ```sh
-# 0) place FocalTech's proprietary libfprint .so:
-sudo mkdir -p /opt/focaltech && sudo cp /path/to/focaltech-libfprint.so /opt/focaltech/matcher.so
+# 0) install FocalTech's proprietary libfprint .so as the matcher (validated):
+sudo bash bio/get-matcher.sh /path/to/driver.deb   # or .rpm / .so / dir, or: --search
 
 # 1) build the standalone tool
 cd bio && bash build.sh          # -> ./ftbio   (needs libusb-1.0 dev headers)

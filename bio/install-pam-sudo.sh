@@ -10,7 +10,7 @@ PAM=/etc/pam.d/sudo
 MARK="# focaltech-fingerprint"
 
 [ "$(id -u)" = 0 ] || { echo "root required: sudo bash $0"; exit 1; }
-[ -f "$OPT/matcher.so" ] || { echo "missing $OPT/matcher.so — place FocalTech's libfprint .so there (see README)"; exit 1; }
+[ -f "$OPT/matcher.so" ] || { echo "missing $OPT/matcher.so — install it first:  sudo bash $SRC/get-matcher.sh <driver.deb|.rpm|.so|--search>"; exit 1; }
 
 echo "1) build ftbio"; bash "$SRC/build.sh"
 echo "2) install to $OPT"; mkdir -p "$OPT"; install -m 0755 "$SRC/ftbio" "$OPT/ftbio"
