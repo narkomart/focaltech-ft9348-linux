@@ -9,8 +9,8 @@
 **нет рабочего драйвера**.
 
 **Статус:** захват, регистрация и сравнение отпечатков работают; вход по отпечатку подключён через PAM.
-Проверено: вход по отпечатку в **sudo** и **разблокировка экрана GNOME** отпечатком. На реальных
-снимках зарегистрированный палец совпадал на каждом кадре, а чужой палец отвергался на каждом кадре.
+Проверено: вход по отпечатку в **sudo** и **разблокировка экрана GNOME** отпечатком. После регистрации
+по 30 касаниям — 9 входов в sudo из 9, обычно с первого-второго касания; чужой палец не прошёл ни разу.
 
 > Всё началось с того, что штатные `libfprint`/`fprintd` содержат только драйвер Goodix, community
 > kernel-драйверы написаны под другие ревизии FocalTech (`9338`/`93a9`/`9e65`, не `9348`), а чип
@@ -91,8 +91,18 @@ sudo bash bio/get-matcher.sh --search                # или просканир
    offset-ы — только из `nm`, не из Ghidra.**
 8. **Проверка точности (на реальных пальцах).** 12 кадров своего пальца → все совпали (TAR 100%);
    8 кадров чужого → все отвергнуты (FAR 0%). Матчер FocalTech надёжно различает пальцы.
+   *Позже выяснилось, что «100%» — артефакт:* проверяли на тех же кадрах, по которым регистрировали.
 9. **Продукт: автономный бинарь + вход.** Собрали `bio/ftbio` (наш захват + матчер по имени символа).
    Вход по пальцу в **sudo** (PAM) и **разблокировка экрана GNOME** — работают.
+10. **«Узнаёт через раз» (ноябрь 2026).** В работе палец узнавался примерно через раз. Честный замер на
+   кадрах, которых нет в шаблоне: шаблон из 6 касаний узнаёт 1 новое касание из 6, из 11 касаний —
+   9 из 12; чужой палец — 0 во всех вариантах. Сенсор 3×4 мм, и 12 касаний покрывают палец лишь частично.
+   Второе: после совпадения матчер сообщает `upd=1`, но сам шаблон не меняет — нужен
+   `focal_UpdateTemplate` и сохранение, причём только при `actMode=2` в `focal_IdentifyByImage`
+   (как в драйвере FocalTech; с `1` обновление отказывает). Третье: gdm мог запустить проверку дважды,
+   две копии дрались за USB, и сенсор переподключался. Исправлено: регистрация по 30 касаниям,
+   самообучение шаблона после каждого входа (матчер сам ограничивает рост ~0,75 МБ), одна проверка
+   за раз (`flock`), строка в журнале на каждую попытку. Итог — 9 из 9 на железе.
 
 Итог: два наложившихся заблуждения — неверный транспорт (bulk вместо control) и неверный матчер (NBIS
 вместо родного CNN). Архитектура решения: **наш захват (libusb/control) + проприетарный CNN-матчер
@@ -121,7 +131,8 @@ cd bio && bash build.sh          # -> ./ftbio   (нужны dev-заголовк
 # 2) освободить устройство (чтобы fprintd его не держал)
 sudo systemctl stop fprintd
 
-# 3) зарегистрировать палец (коснуться сенсора в кнопке питания ~12 раз, слегка смещая)
+# 3) зарегистрировать палец: 30 касаний сенсора в кнопке питания, каждый раз сдвигая и поворачивая
+#    палец, захватывая и края, и подушечку (от этого зависит, как часто палец будет узнаваться)
 sudo ./ftbio enroll "$USER"      # шаблон -> /etc/focaltech/<user>.tpl
 
 # 4) проверить (одно касание)
@@ -145,7 +156,12 @@ sudo bash bio/setup-gdm.sh
 правильный путь — отдать CNN-матчер самому libfprint-драйверу вместо NBIS.
 
 Переменные окружения `ftbio`: `FT_SO` (путь к матчеру `.so`), `FT_TPLDIR` (каталог шаблонов, по
-умолчанию `/etc/focaltech`), `FT_TIMEOUT` (таймаут verify, мс), `FTLOG=1` (подробный лог алгоритма).
+умолчанию `/etc/focaltech`), `FT_TIMEOUT` (таймаут verify, мс), `FT_ENROLL_N` (касаний при регистрации,
+по умолчанию 30), `FT_NO_UPDATE=1` (не дообучать шаблон), `FTLOG=1` (подробный лог алгоритма).
+
+Каждая проверка пишет строку в журнал — `journalctl -t ftbio`: совпало ли, сколько было касаний и
+сравнённых кадров, оценка совпадения, обновился ли шаблон. Если палец узнаётся плохо — перерегистрируйте
+его (`sudo ./ftbio enroll "$USER"`): шаблон, снятый по 12 касаниям старой версией, слишком мал.
 
 ## Восстановление доступа
 
@@ -180,8 +196,10 @@ sensor, commonly built into the laptop **power button**) work under Linux — wh
 driver**.
 
 **Status:** capture, enrollment and matching work; fingerprint login is wired via PAM. Verified: **sudo**
-login by fingerprint and **GNOME screen unlock** by fingerprint. On real captures the enrolled finger
-matched on every frame and a different finger was rejected on every frame.
+login by fingerprint and **GNOME screen unlock** by fingerprint. After a 30-touch enrollment: 9 of 9 sudo
+logins, usually on the first or second touch; a different finger never matched. The template self-learns
+after every successful login (`focal_UpdateTemplate`, needs `actMode=2`); each attempt is logged —
+`journalctl -t ftbio`.
 
 **Not self-contained:** matching uses FocalTech's **proprietary** libfprint `.so` (a GhostNet CNN
 matcher), which is copyrighted and **NOT included**. Supply it yourself and let the helper validate and

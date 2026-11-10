@@ -27,6 +27,8 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <sys/file.h>
+#include <syslog.h>
 #include <errno.h>
 
 #define SO_DEFAULT "/opt/focaltech/matcher.so"
@@ -99,6 +101,7 @@ static uint32_t (*fn_match_score)(void);
 static int (*fn_save)(uint16_t,uint8_t*,uint32_t*,uint8_t*);
 static int (*fn_init_tpl)(uint16_t,uint8_t,uint32_t,uint8_t*);
 static void (*fn_init_log)(void*);
+static int (*fn_update)(uint8_t,uint8_t*);
 
 /* register focal_InitFunc* callbacks (stubs; capture is done by us and passed to Enroll/Identify directly) */
 static void reg_callbacks(void){
@@ -132,6 +135,7 @@ static int algo_open(void){
   fn_match_score=SYM("focal_GetMatchScores");
   fn_save       =SYM("focal_SaveAlgTplData");
   fn_init_tpl   =SYM("focal_InitAlgTplData");
+  fn_update     =SYM("focal_UpdateTemplate");
   void *g_device=SYM("g_device");
   reg_callbacks();
   if(missing){
@@ -165,7 +169,8 @@ static int sensor_open(void){
   libusb_init(&uctx);
   uh=libusb_open_device_with_vid_pid(uctx,VID,PID);
   if(!uh){fprintf(stderr,"device %04x:%04x not found (fprintd stopped? root?)\n",VID,PID);return -1;}
-  libusb_set_auto_detach_kernel_driver(uh,1); libusb_claim_interface(uh,0);
+  libusb_set_auto_detach_kernel_driver(uh,1);
+  if(libusb_claim_interface(uh,0)){fprintf(stderr,"sensor busy\n");libusb_close(uh);uh=NULL;return -1;}
   wr(0x34,0xff,0);wr(0x34,2,0);wr(0x6f,0,0xff00);
   wr(0x3b,1,0x1f);wr(0x3b,1,0x1e);usleep(10000);
   return 0;
@@ -184,9 +189,15 @@ static void wait_release(void){int n=0;while(finger()&&n<200){usleep(50000);n++;
 static const char*tpldir(void){const char*e=getenv("FT_TPLDIR");return e?e:TPLDIR;}
 static int tpl_path(const char*u,char*o,size_t n){return snprintf(o,n,"%s/%s.tpl",tpldir(),u);}
 static int tpl_write(const char*u,uint8_t type,uint32_t size,uint8_t*data){
-  mkdir(tpldir(),0700); char p[512]; tpl_path(u,p,sizeof p);
-  FILE*f=fopen(p,"wb"); if(!f){fprintf(stderr,"write %s: %s\n",p,strerror(errno));return -1;}
-  fwrite(&type,1,1,f); fwrite(&size,4,1,f); fwrite(data,1,size,f); fclose(f); chmod(p,0600); return 0;
+  /* atomic: tmp + fsync + rename, so a crash or full disk never leaves a broken template */
+  mkdir(tpldir(),0700); char p[512]; tpl_path(u,p,sizeof p); char tmp[600]; snprintf(tmp,sizeof tmp,"%s.tmp",p);
+  FILE*f=fopen(tmp,"wb"); if(!f){fprintf(stderr,"write %s: %s\n",tmp,strerror(errno));return -1;}
+  int ok=fwrite(&type,1,1,f)==1 && fwrite(&size,4,1,f)==1 && fwrite(data,1,size,f)==size;
+  if(fflush(f)||fsync(fileno(f)))ok=0;
+  if(fclose(f))ok=0;
+  chmod(tmp,0600);
+  if(!ok||rename(tmp,p)){unlink(tmp);fprintf(stderr,"write %s failed\n",p);return -1;}
+  return 0;
 }
 static int tpl_read(const char*u,uint8_t*type,uint32_t*size,uint8_t*data,uint32_t cap){
   char p[512]; tpl_path(u,p,sizeof p); FILE*f=fopen(p,"rb"); if(!f)return -1;
@@ -195,7 +206,7 @@ static int tpl_read(const char*u,uint8_t*type,uint32_t*size,uint8_t*data,uint32_
 }
 
 /* ---------- commands ---------- */
-static uint8_t tpl[262144];
+static uint8_t tpl[8u<<20]; /* 12 frames = 247 KB; grows with enrollment size and self-learning, capped by the matcher at ~0.75 MB */
 
 static int cmd_check(void){
   if(algo_open()){fprintf(stderr,"NOT OK\n");return 2;}
@@ -203,11 +214,11 @@ static int cmd_check(void){
   return 0;
 }
 static int cmd_enroll(const char*user){
-  const int NEED=12;
+  const char*en=getenv("FT_ENROLL_N"); const int NEED=(en&&atoi(en)>0)?atoi(en):30;
   if(sensor_open()||algo_open())return 2;
-  printf("Enroll '%s': touch the power-button sensor %d times (lift and re-touch, moving slightly).\n",user,NEED);
+  printf("Enroll '%s': touch the power-button sensor %d times: lift each time, shift and rotate the finger, cover the tip and the edges too.\n",user,NEED);
   int accepted=0;
-  for(int c=0;c<40 && accepted<NEED;c++){
+  for(int c=0;c<NEED*3 && accepted<NEED;c++){
     unsigned char buf[FRAME];
     if(wait_and_grab(buf,30000)){printf("timeout\n");break;}
     memcpy(g_frame,buf,FRAME);
@@ -223,27 +234,67 @@ static int cmd_enroll(const char*user){
   char p[512];tpl_path(user,p,sizeof p); printf("Done: template (%u bytes) -> %s. Frames: %d.\n",size,p,accepted);
   sensor_close(); return 0;
 }
+/* actMode 2 = verify, as in FocalTech's own driver; with 1 focal_UpdateTemplate refuses (-1) */
+static uint8_t actmode(void){const char*e=getenv("FT_ACTMODE");return e?(uint8_t)atoi(e):2;}
+static int last_upd; static uint32_t last_score;
 static int do_match(void){
-  uint8_t fid=0xff,upd=0; int ir=fn_identify(g_frame,1,&fid,&upd);
+  uint8_t fid=0xff,upd=0; int ir=fn_identify(g_frame,actmode(),&fid,&upd);
   uint32_t mfid=fn_match_fid(); uint32_t sc=fn_match_score();
-  if(getenv("FTLOG"))fprintf(stderr,"identify ret=%d fid=%u score=%u\n",ir,mfid,sc);
+  last_upd=upd; last_score=sc;
+  if(getenv("FTLOG"))fprintf(stderr,"identify ret=%d fid=%u score=%u upd=%u\n",ir,mfid,sc,upd);
   return (ir==0 && mfid==FID)?0:1;
+}
+/* Self-learning. After a match the matcher reports upd=1 but does NOT change the template by itself:
+ * focal_UpdateTemplate merges the matched frame in, then we save. Without this the template stays
+ * exactly as enrolled, and a 3x4 mm sensor only ever recognises the patches seen at enrollment. */
+static int save_updated(const char*user){
+  if(!last_upd || !fn_update || getenv("FT_NO_UPDATE")) return 0;
+  uint8_t ufid=0xff; int ur=fn_update(1,&ufid);
+  if(ur!=0){syslog(LOG_INFO,"template update skipped: UpdateTemplate=%d",ur);return 0;}
+  uint8_t type=0; uint32_t size=0;
+  int sr=fn_save(FID,&type,&size,tpl);
+  if(sr!=0||size==0||size>sizeof tpl){syslog(LOG_WARNING,"template update: SaveAlgTplData=%d size=%u",sr,size);return -1;}
+  if(tpl_write(user,type,size,tpl))return -1;
+  syslog(LOG_INFO,"template updated for %s: %u bytes",user,size);
+  return 1;
+}
+/* one instance at a time: gdm can start the check twice, and two processes fighting over USB reset the sensor */
+static int take_lock(int wait_ms){
+  int fd=open("/run/focaltech.lock",O_RDWR|O_CREAT|O_CLOEXEC,0600);
+  if(fd<0)return 0;
+  for(int t=0;;t+=100){ if(!flock(fd,LOCK_EX|LOCK_NB))return 0; if(t>=wait_ms)return -1; usleep(100000); }
 }
 static int cmd_verify(const char*user){
   uint8_t type=0; uint32_t size=0;
   if(tpl_read(user,&type,&size,tpl,sizeof tpl)){fprintf(stderr,"no template for '%s' (enroll first)\n",user);return 2;}
   if(algo_open())return 2;
   if(fn_init_tpl(FID,type,size,tpl)!=0){fprintf(stderr,"InitAlgTplData failed\n");return 2;}
+  if(take_lock(1500)){syslog(LOG_NOTICE,"verify %s: another check is already running",user);return 2;}
   if(sensor_open())return 2;
   fprintf(stderr,"Touch the sensor...\n");
   int timeout_ms=getenv("PAM_TYPE")?8000:15000; const char*to=getenv("FT_TIMEOUT"); if(to){int v=atoi(to);if(v>0)timeout_ms=v;}
-  int rc=1,waited=0;
+  int rc=1,waited=0,touches=0,frames=0,weak=0,wasf=0;
   for(;;){
     unsigned char buf[FRAME];
-    if(finger()){usleep(60000); if(grab(buf)==FRAME && stdev(buf,FRAME)>=12.0){memcpy(g_frame,buf,FRAME); if(do_match()==0){rc=0;break;}}}
+    int f=finger();
+    if(f){
+      if(!wasf)touches++;
+      usleep(60000);
+      if(grab(buf)==FRAME){
+        if(stdev(buf,FRAME)>=12.0){frames++; memcpy(g_frame,buf,FRAME); if(do_match()==0){rc=0;break;}}
+        else weak++;
+      }
+    }
+    wasf=f;
     usleep(50000); waited+=50; if(waited>=timeout_ms)break;
   }
-  sensor_close(); fprintf(stderr, rc==0?"match\n":"no match\n"); return rc;
+  int upd = rc==0 ? save_updated(user) : 0;
+  sensor_close();
+  /* one line per attempt in the journal: `journalctl -t ftbio` */
+  syslog(rc==0?LOG_INFO:LOG_NOTICE,"verify %s: %s, touches %d, frames matched %d, weak %d, score %u, template %s, %d ms",
+         user, rc==0?"MATCH":(touches?"no match":"no finger"), touches, frames, weak, last_score,
+         upd>0?"updated":(upd<0?"UPDATE FAILED":"unchanged"), waited);
+  fprintf(stderr, rc==0?"match\n":"no match\n"); return rc;
 }
 static int cmd_verify_file(const char*user,const char*path){
   uint8_t type=0; uint32_t size=0;
@@ -252,10 +303,13 @@ static int cmd_verify_file(const char*user,const char*path){
   if(fn_init_tpl(FID,type,size,tpl)!=0){fprintf(stderr,"InitAlgTplData failed\n");return 2;}
   FILE*f=fopen(path,"rb"); if(!f){fprintf(stderr,"open %s\n",path);return 2;}
   if(fread(g_frame,1,FRAME,f)!=FRAME){fclose(f);return 2;} fclose(f);
-  int rc=do_match(); printf("%s: %s\n",path,rc==0?"MATCH":"no match"); return rc;
+  int rc=do_match();
+  if(rc==0 && getenv("FT_UPDATE")) save_updated(user);
+  printf("%s: %s score=%u upd=%d\n",path,rc==0?"MATCH":"no match",last_score,last_upd); return rc;
 }
 
 int main(int argc,char**argv){
+  openlog("ftbio",LOG_PID,LOG_AUTHPRIV);
   const char*pu=getenv("PAM_USER");
   const char*user=(argc>=3)?argv[2]:pu;
   if(argc>=2 && !strcmp(argv[1],"check"))          return cmd_check();
